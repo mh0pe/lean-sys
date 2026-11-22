@@ -14,19 +14,47 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #include <sys/clonefile.h>
+#ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
+#define LS_NEEDS_NOSIGPIPE
+#endif
 #define LS_CLONE(s, d) (clonefile(s, d, 0) == 0 ? 0 : link(s, d))
 #define LS_FSYNC(fd) (fcntl(fd, F_BARRIERFSYNC) < 0 && fsync(fd) < 0)
-static inline int ls_accept(int lfd) { int c = accept(lfd, NULL, NULL); if (c >= 0) fcntl(c, F_SETFD, FD_CLOEXEC); return c; }
 #else
 #define LS_CLONE(s, d) link(s, d)
 #define LS_FSYNC(fd) (fsync(fd) < 0)
-static inline int ls_accept(int lfd) { return accept4(lfd, NULL, NULL, SOCK_CLOEXEC); }
 #endif
 int rename(const char *, const char *); extern char **environ;
 #define SA (struct sockaddr*)
 static inline lean_obj_res R(int64_t rc) { return lean_io_result_mk_ok(lean_box_uint64(rc < 0 ? ((1ULL << 63) | ((uint64_t)(uint32_t)errno << 32)) : ((uint64_t)rc & 0x7FFFFFFFFFFFFFFFULL))); }
 static inline int64_t fail_close(int fd) { int e = errno; close(fd); errno = e; return -1; }
+#ifdef __APPLE__
+static inline int ls_prepare_socket(int fd) {
+    if (fd < 0) return fd;
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0)
+        return (int)fail_close(fd);
+#ifdef LS_NEEDS_NOSIGPIPE
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) < 0)
+        return (int)fail_close(fd);
+#endif
+    return fd;
+}
+static inline int ls_socket(void) {
+    return ls_prepare_socket(socket(AF_INET, SOCK_STREAM, 0));
+}
+static inline int ls_accept(int fd) {
+    return ls_prepare_socket(accept(fd, NULL, NULL));
+}
+#else
+static inline int ls_socket(void) {
+    return socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+}
+static inline int ls_accept(int fd) {
+    return accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+}
+#endif
 LEAN_EXPORT lean_obj_res leansys_open_flock(b_lean_obj_arg path, uint8_t wr, uint8_t ex, uint8_t nb) {
     if (wr == 3) return R(close((int)((uint32_t)ex | ((uint32_t)nb << 8))));
     int fd = open(lean_string_cstr(path), O_CLOEXEC | (wr ? (O_CREAT | O_RDWR | (wr == 2 ? O_APPEND : 0) | (wr == 4 ? O_TRUNC : 0)) : O_RDONLY), 0644);
@@ -54,7 +82,7 @@ LEAN_EXPORT lean_obj_res leansys_spawn_group(b_lean_obj_arg cmd, b_lean_obj_arg 
 LEAN_EXPORT lean_obj_res leansys_kill_wait_group(uint32_t pid, uint32_t sig, uint8_t nohang) { if (sig > 0 && pid > 1) kill(-(pid_t)pid, (int)sig); int st = 0; pid_t r = waitpid((pid_t)pid, &st, nohang ? WNOHANG : 0);
     return R(r <= 0 ? r : ((int64_t)r << 16) | (WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st))); }
 LEAN_EXPORT lean_obj_res leansys_net_listen(b_lean_obj_arg host, uint16_t port, uint32_t backlog) {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1; if (fd < 0) return R(-1); setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    int fd = ls_socket(), one = 1; if (fd < 0) return R(-1); setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) }; socklen_t al = sizeof(a);
     if (inet_pton(AF_INET, lean_string_cstr(host), &a.sin_addr) <= 0) a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if ((backlog == 0 ? connect(fd, SA &a, al) : (bind(fd, SA &a, al) | listen(fd, (int)backlog))) < 0) return R(fail_close(fd));
